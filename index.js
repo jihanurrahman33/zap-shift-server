@@ -24,8 +24,13 @@ const verifyFBToken = async (req, res, next) => {
 
 const admin = require("firebase-admin");
 
-const serviceAccount = require("./zap-shift-firebase-adminsdk.json");
+//const serviceAccount = require("./zap-shift-firebase-adminsdk.json");
+// const serviceAccount = require("./firebase-admin-key.json");
 
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+  "utf8"
+);
+const serviceAccount = JSON.parse(decoded);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
@@ -36,6 +41,7 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.jwss9hh.mongodb.net/?appName=Cluster0`;
 
 const crypto = require("crypto");
+const { format } = require("path");
 function generateTrackingId() {
   const prefix = "PRCL";
   const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
@@ -74,14 +80,25 @@ async function run() {
       }
       next();
     };
+    const verifyRider = async (req, res, next) => {
+      const email = req.decoded_email;
+
+      const query = { email };
+
+      const user = await usersCollection.findOne(query);
+      if (!user || user.role !== "rider") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
+    };
 
     // Connect the client to the server	(optional starting in v4.7)
     await client.connect();
-    // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
-    );
+    // // Send a ping to confirm a successful connection
+    // await client.db("admin").command({ ping: 1 });
+    // console.log(
+    //   "Pinged your deployment. You successfully connected to MongoDB!"
+    // );
     //apis
     app.get("/", (req, res) => {
       res.send("server is live");
@@ -240,7 +257,7 @@ async function run() {
         if (session.payment_status === "paid") {
           const resultPayment = await paymentCollection.insertOne(payment);
           logTracking(trackingId, "parcel_paid");
-          res.send({
+          return res.send({
             success: true,
             modifyParcel: result,
             trackingId: trackingId,
@@ -249,7 +266,7 @@ async function run() {
           });
         }
       }
-      res.send({ success: false });
+      return res.send({ success: false });
     });
     //payment related apis
     app.get("/payments", verifyFBToken, async (req, res) => {
@@ -388,6 +405,26 @@ async function run() {
       res.send(result);
     });
 
+    app.get("/parcels/delivery-status/stats", async (req, res) => {
+      const pipeline = [
+        {
+          $group: {
+            _id: "$deliveryStatus",
+            count: { $sum: 1 },
+          },
+        },
+        {
+          $project: {
+            status: "$_id",
+            count: 1,
+          },
+        },
+      ];
+
+      const result = await parcelsCollection.aggregate(pipeline).toArray();
+      res.send(result);
+    });
+
     //riders related apis
     app.get("/riders", async (req, res) => {
       const { status, district, workStatus } = req.query;
@@ -443,6 +480,66 @@ async function run() {
           updateUser
         );
       }
+      res.send(result);
+    });
+
+    app.get("/riders/delivery-per-day", async (req, res) => {
+      const email = req.query.email;
+      const pipeline = [
+        // 1) Only this rider's delivered parcels
+        {
+          $match: {
+            riderEmail: email,
+            deliveryStatus: "parcel_delivered",
+          },
+        },
+
+        // 2) Join with trackings collection
+        {
+          $lookup: {
+            from: "trackings",
+            localField: "trackingId",
+            foreignField: "trackingId",
+            as: "parcel_trackings",
+          },
+        },
+
+        // 3) Turn parcel_trackings array into single docs
+        {
+          $unwind: "$parcel_trackings",
+        },
+
+        // 4) Only keep trackings where status is parcel_delivered
+        {
+          $match: {
+            "parcel_trackings.status": "parcel_delivered",
+          },
+        },
+
+        // 5) Group by day (date only) and count parcels
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%Y-%m-%d", // e.g. "2025-12-07"
+                date: "$parcel_trackings.createdAt", // <-- change this field name if needed
+              },
+            },
+            count: { $sum: 1 },
+          },
+        },
+
+        // 6) Make the output nicer
+        {
+          $project: {
+            _id: 0,
+            date: "$_id",
+            deliveredParcels: "$count",
+          },
+        },
+      ];
+
+      const result = await parcelsCollection.aggregate(pipeline).toArray();
       res.send(result);
     });
 
